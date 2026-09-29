@@ -61,13 +61,13 @@ View the build options in Makefile. OSS only, TinyALSA only or both is possible.
 
 ```sh
 # Single note: program 1 from sc3.bnk, note 60 (middle C), 1500ms
-./mop -b sc3.bnk -p 1 -n 60 -d 1500
+./mop -b mop.bnk -p 1 -n 60 -d 1500
 
 # C major chord (C4, E4, G4)
-./mop -b sc3.bnk -p 1 -n "60,64,67" -d 1500
+./mop -b mop.bnk -p 1 -n "60,64,67" -d 1500
 
 # G7 chord (G3, B3, D4, F4)
-./mop -b sc3.bnk -p 1 -n "55,59,62,65" -d 1500
+./mop -b mop.bnk -p 1 -n "55,59,62,65" -d 1500
 
 # Raw 30-byte AdLib instrument, as hex, with a chord
 ./mop -r 00000101030F050001030F000000000001040D0700020400000001010000 -n "60,64,67" -d 1500
