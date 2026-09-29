@@ -45,26 +45,15 @@ libraries below and your audio device.
 ## Building
 
 ```sh
-gcc -O2 -Iopal/include \
-    mop.c opal/src/opal.c \
-    -o mop -lm
+View the build options in Makefile. OSS only, TinyALSA only or both is possible. If both are compiled in via -DAUDIO_HAVE_OSS -DAUDIO_HAVE_TINYALSA - the OSS is tried first with TinyALSA as fallback.
 ```
-
-Adjust the `-I` path and the `opal/src/opal.c` source path to wherever
-you've vendored the Opal sources in your tree. `tml.h` is header-only
-and included directly by `mop.c` (`TML_IMPLEMENTATION` is defined
-in exactly one translation unit).
-
-If you're linking against tinyalsa instead of OSS, add `-ltinyalsa` and
-make sure `audio.c` is built with the matching backend selected.
-
 ## Usage
 
 ```sh
 # Play a MIDI file with an external instrument bank
 ./mop song.mid instruments.bnk
 
-# Play a MIDI file using the built-in bank (if compiled in)
+# Play a MIDI file using the built-in bank
 ./mop song.mid
 ```
 
@@ -102,7 +91,7 @@ make sure `audio.c` is built with the matching backend selected.
 
 ## License
 
-`mop.c` and the rest of this project's own source are licensed as stated in the source code (zlib licence).
+`mop.c` and the rest of this project's own source are licensed as stated in the source code (zlib license).
 
 Bundled/linked dependencies carry their own licenses:
 
