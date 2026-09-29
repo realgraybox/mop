@@ -1,4 +1,4 @@
-# opal2play
+# mop
 
 A small, self-contained MIDI player for Linux that renders General MIDI
 files through OPL3 FM synthesis — the classic AdLib / Sound Blaster sound
@@ -46,13 +46,13 @@ libraries below and your audio device.
 
 ```sh
 gcc -O2 -Iopal/include \
-    opal2play.c opal/src/opal.c \
-    -o opal2play -lm
+    mop.c opal/src/opal.c \
+    -o mop -lm
 ```
 
 Adjust the `-I` path and the `opal/src/opal.c` source path to wherever
 you've vendored the Opal sources in your tree. `tml.h` is header-only
-and included directly by `opal2play.c` (`TML_IMPLEMENTATION` is defined
+and included directly by `mop.c` (`TML_IMPLEMENTATION` is defined
 in exactly one translation unit).
 
 If you're linking against tinyalsa instead of OSS, add `-ltinyalsa` and
@@ -62,26 +62,26 @@ make sure `audio.c` is built with the matching backend selected.
 
 ```sh
 # Play a MIDI file with an external instrument bank
-./opal2play song.mid instruments.bnk
+./mop song.mid instruments.bnk
 
 # Play a MIDI file using the built-in bank (if compiled in)
-./opal2play song.mid
+./mop song.mid
 ```
 
 ### Instrument test mode
 
 ```sh
 # Single note: program 1 from sc3.bnk, note 60 (middle C), 1500ms
-./opal2play -b sc3.bnk -p 1 -n 60 -d 1500
+./mop -b sc3.bnk -p 1 -n 60 -d 1500
 
 # C major chord (C4, E4, G4)
-./opal2play -b sc3.bnk -p 1 -n "60,64,67" -d 1500
+./mop -b sc3.bnk -p 1 -n "60,64,67" -d 1500
 
 # G7 chord (G3, B3, D4, F4)
-./opal2play -b sc3.bnk -p 1 -n "55,59,62,65" -d 1500
+./mop -b sc3.bnk -p 1 -n "55,59,62,65" -d 1500
 
 # Raw 30-byte AdLib instrument, as hex, with a chord
-./opal2play -r 00000101030F050001030F000000000001040D0700020400000001010000 -n "60,64,67" -d 1500
+./mop -r 00000101030F050001030F000000000001040D0700020400000001010000 -n "60,64,67" -d 1500
 ```
 
 | Flag | Meaning |
@@ -102,8 +102,7 @@ make sure `audio.c` is built with the matching backend selected.
 
 ## License
 
-`opal2play.c` and the rest of this project's own source are licensed
-under the [zlib license](LICENSE).
+`mop.c` and the rest of this project's own source are licensed as stated in the source code (zlib licence).
 
 Bundled/linked dependencies carry their own licenses:
 
