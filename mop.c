@@ -910,6 +910,33 @@ static int parse_raw_hex(const char *str, uint8_t out[30]) {
     return 0;
 }
 
+// Function that finds the raw MIDI data inside a RIFF container
+unsigned char* unwrap_riff_midi(unsigned char* data, unsigned int* size) {
+
+    if (*size < 20) return data;
+
+
+    if (memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "RMID", 4) == 0){
+        unsigned int offset = 12;
+        
+        while (offset + 8 < *size) {
+            unsigned int chunk_size = data[offset + 4] | 
+                                      (data[offset + 5] << 8) | 
+                                      (data[offset + 6] << 16) | 
+                                      (data[offset + 7] << 24);
+            
+            if (memcmp(data + offset, "data", 4) == 0) {
+                if (offset + 8 + chunk_size <= *size) {
+                    *size = chunk_size;
+                    return data + offset + 8;
+                }
+            }
+            offset += 8 + ((chunk_size + 1) & ~1);
+        }
+    }
+    return data;
+}
+
 // Main
 int main(int argc, char **argv) {
 	
@@ -1013,12 +1040,55 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 	}
-		
-	tml_message *song = tml_load_filename(argv[1]);
+	// RIFF (little-endian) data guard
+	FILE* f = fopen(argv[1], "rb");
+	if (!f) {
+		fprintf(stderr, "Could not open file %s\n", argv[1]);
+		return 1;
+	}
+	fseek(f, 0, SEEK_END);
+	unsigned int file_size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+
+	unsigned char* file_buffer = (unsigned char*)malloc(file_size);
+	if (!file_buffer) {
+		fprintf(stderr, "Could not allocate memory.\n");
+		fclose(f);
+		return 1;
+	}
+
+	size_t bytes_read = fread(file_buffer, 1, file_size, f);
+	fclose(f);
+	
+	if (bytes_read != file_size) {
+		fprintf(stderr, "Could not read the entire file (read %zu of %u bytes).\n", bytes_read, file_size);
+		free(file_buffer);
+		return 1;
+	}
+
+	// RMID-unpack
+	unsigned int midi_size = file_size;
+	unsigned char* raw_midi_ptr = unwrap_riff_midi(file_buffer, &midi_size);
+	
+	// check midi format - only 0 and 1 supported
+	if (midi_size >= 14 && memcmp(raw_midi_ptr, "MThd", 4) == 0)  {
+		unsigned short midi_format = (raw_midi_ptr[8] << 8) | raw_midi_ptr[9];
+
+		if (midi_format > 1) {
+			fprintf(stderr, "%s: MIDI format %u unsupported\n", argv[1], midi_format);
+			
+			free(file_buffer);
+			return 1;
+		}
+	}
+
+	// use tml_load_memory instead of tml_load_filename
+	tml_message *song = tml_load_memory(raw_midi_ptr, midi_size);
+
 	if (!song) {
 		fprintf(stderr, "Could not load MIDI %s\n", argv[1]);
 		return 1;
-	}	
+	}		
 
     if (audio_init(SAMPLE_RATE, 2) < 0) {
 		fprintf(stderr, "Unable to initialize audio\n");
@@ -1035,6 +1105,7 @@ int main(int argc, char **argv) {
     audio_close();
     free(events);
     tml_free(song);
+	free(file_buffer);   //RIFF (little-endian) 
     return 0;
 	}	
 }
