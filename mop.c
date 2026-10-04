@@ -174,6 +174,7 @@ static unsigned long voice_age;
 extern const unsigned char _binary_mop_bnk_start[];
 extern const unsigned char _binary_mop_bnk_end[];
 
+
 static uint8_t percussion_program(int note) {
     if (note < 35 || note > 81)
         return PERC_BASE; // fallback to first drum
@@ -726,10 +727,28 @@ static void render_samples(uint64_t samples) {
     }
 }
 
+#define MAX_F2_TRACKS 256
+static unsigned int track_boundary_ms[MAX_F2_TRACKS];
+static int track_boundary_count = 0;
+static void reset_channels(void) {
+    int i;
+    for (i = 0; i < MAX_VOICES; i++)
+        if (voices[i].active)
+            voice_free(i);   // keys off + clears the voice as in the allocator
+    init_state();            // program/volume/expression/sustain/pitch/pan back to defaults
+}
+
 static void play(tml_message *msg) {
     uint64_t rendered = 0;
+    
+	int boundary_idx = 0;
 
     for (; msg; msg = msg->next) {
+		while (boundary_idx < track_boundary_count && msg->time >= track_boundary_ms[boundary_idx]) {
+			reset_channels();
+			boundary_idx++;
+		}
+
         uint64_t target = (uint64_t)msg->time * SAMPLE_RATE / 1000;
         if (target > rendered) {
             render_samples(target - rendered);
@@ -1070,26 +1089,102 @@ int main(int argc, char **argv) {
 	unsigned int midi_size = file_size;
 	unsigned char* raw_midi_ptr = unwrap_riff_midi(file_buffer, &midi_size);
 	
-	// check midi format - only 0 and 1 supported
+	tml_message* song = NULL;
+
+	// check MIDI format and read
 	if (midi_size >= 14 && memcmp(raw_midi_ptr, "MThd", 4) == 0)  {
 		unsigned short midi_format = (raw_midi_ptr[8] << 8) | raw_midi_ptr[9];
+		unsigned short tracks = (raw_midi_ptr[10] << 8) | raw_midi_ptr[11];
 
-		if (midi_format > 1) {
+		if (midi_format > 2) {
 			fprintf(stderr, "%s: MIDI format %u unsupported\n", argv[1], midi_format);
-			
 			free(file_buffer);
 			return 1;
 		}
-	}
 
-	// use tml_load_memory instead of tml_load_filename
-	tml_message *song = tml_load_memory(raw_midi_ptr, midi_size);
+		if (midi_format == 2) {
+			unsigned char* track_ptr = raw_midi_ptr + 14;
+			unsigned int accumulated_time_ms = 0;
+			tml_message* last_msg = NULL;
+
+			// We create a temporary buffer for a valid 1-track MIDI file in memory
+			// A MThd header (14 bytes) + a MTrk spor
+			unsigned char* tmp_midi = (unsigned char*)malloc(midi_size);
+			if (!tmp_midi) {
+				fprintf(stderr, "Could not allocate temporary memory for Format 2.\n");
+				free(file_buffer);
+				return 1;
+			}
+
+			// Copy the original MThd header into our temporary buffer
+			memcpy(tmp_midi, raw_midi_ptr, 14);
+			// Force the format to be Format 1 (or 0) and the number of tracks to be 1
+			tmp_midi[8] = 0; tmp_midi[9] = 1;   // Format 1
+			tmp_midi[10] = 0; tmp_midi[11] = 1; // 1 Track
+
+			for (unsigned short i = 0; i < tracks; i++) {
+				if (track_ptr + 8 > raw_midi_ptr + midi_size) break;
+				if (memcmp(track_ptr, "MTrk", 4) != 0) break;
+
+				unsigned int track_len = (track_ptr[4] << 24) | (track_ptr[5] << 16) | 
+				                         (track_ptr[6] << 8)  | track_ptr[7];
+				
+				if (track_ptr + 8 + track_len > raw_midi_ptr + midi_size) break;
+
+				// Copy the track into the temporary MIDI file right after the header
+				memcpy(tmp_midi + 14, track_ptr, 8 + track_len);
+				unsigned int tmp_midi_size = 14 + 8 + track_len;
+
+				// Let tml.h load this single track
+				tml_message* track_song = tml_load_memory(tmp_midi, tmp_midi_size);
+
+				if (track_song) {
+					tml_message* curr = track_song;
+					tml_message* prev = NULL;
+
+					// Add the accumulated time from the previous tracks to all events in this track
+					while (curr) {
+						curr->time += accumulated_time_ms;
+						prev = curr;
+						curr = curr->next;
+					}
+
+					if (prev) {
+						accumulated_time_ms = prev->time;
+						if (track_boundary_count < MAX_F2_TRACKS)
+							track_boundary_ms[track_boundary_count++] = accumulated_time_ms;
+					}
+
+					// Chain the track together with the main list (song)
+					if (!song) {
+						song = track_song;
+					} else if (last_msg) {
+						last_msg->next = track_song;
+					}
+					
+					if (prev) {
+						last_msg = prev;
+					}
+				}
+
+				// Go to the next track in the original file
+				track_ptr += 8 + track_len;
+			}
+
+			free(tmp_midi);
+		} 
+		else {
+			// --- FORMAT 0 and 1 PROCESSING (Standard tml.h loading) ---
+			song = tml_load_memory(raw_midi_ptr, midi_size);
+		}
+	}
+	free(file_buffer);
 
 	if (!song) {
-		fprintf(stderr, "Could not load MIDI %s\n", argv[1]);
+		fprintf(stderr, "Could not load MIDI data.\n");
 		return 1;
-	}		
-
+	}
+	
     if (audio_init(SAMPLE_RATE, 2) < 0) {
 		fprintf(stderr, "Unable to initialize audio\n");
 		return 1;
