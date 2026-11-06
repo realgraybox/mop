@@ -52,9 +52,16 @@ libraries below and your audio device.
   [Doom Wiki GENMIDI page](https://doomwiki.org/wiki/GENMIDI).
 - **Double-voice instruments** — the second voice is optional: it only takes
   a free OPL voice and never steals one, and only when more than
-  `SECOND_VOICE_RESERVE` voices are free. When stealing, second voices go
-  first, so under load a note loses its second voice instead of another
-  note being cut off.
+  `SECOND_VOICE_RESERVE` voices are free and silent. When stealing, second
+  voices go first, so under load a note loses its second voice instead of
+  another note being cut off.
+- **Click-free voice reuse** — a new note takes the quietest free voice,
+  read from the chip's envelope state. If that voice can still be heard,
+  it is faded out in about 2 ms (fastest release, then a short delay
+  through the write buffer) before the new note starts.
+- **Drum volume** — with an OP2 bank, drums follow channel volume and
+  expression like other notes (so fade-outs include them). With a BNK bank
+  they use velocity only, with a small boost, as before.
 
 ## Building
 
@@ -73,8 +80,8 @@ Extra `CFLAGS` options:
 | Define | Effect |
 |--------|--------|
 | `-DNO_BNK` | Leave out the BNK loader (OP2 only; the built-in bank must be `.op2`) |
-| `-DMOP_STATS` | Print notes cut, second voices stolen and second voices not started after playback |
-| `-DSECOND_VOICE_RESERVE=n` | Start a second voice only when more than n voices are free (default 2) |
+| `-DMOP_STATS` | Print notes cut, second voices stolen and not started, and voices reused while still audible, after playback |
+| `-DSECOND_VOICE_RESERVE=n` | Start a second voice only when more than n voices are free and silent (default 1) |
 ## Usage
 
 ```sh

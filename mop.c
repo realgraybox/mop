@@ -126,12 +126,12 @@ static void adlib_getsample(int16_t *buf, Bits n) {
 #define SYNTH_CHANNELS 	2	// physical output is always stereo
 
 /*
- * A second voice only starts when more than this many voices are free,
- * so a busy song keeps voices for new notes instead of starting second
+ * A second voice only starts when more than this many voices are free and
+ * silent, so a busy song keeps voices for new notes instead of starting second
  * voices that the next notes steal again.
  */
 #ifndef SECOND_VOICE_RESERVE
-#define SECOND_VOICE_RESERVE 2
+#define SECOND_VOICE_RESERVE 1
 #endif
 
 /*
@@ -684,9 +684,10 @@ static void set_volume(int voice) {
     int amp;
     int att;
 
-    if (is_percussion_channel(voices[voice].channel)) {
-        // Percussion: ignore channel volume/expression, use velocity only,
+    if (is_percussion_channel(voices[voice].channel) && bank.type == BANK_BNK) {
+        // BNK percussion: ignore channel volume/expression, use velocity only,
         // with a slight boost to match melodic instruments.
+        // OP2 drums are loud enough and follow the channel like other notes.
         int vel = voices[voice].velocity; // 0..127
         // Map 1..127 -> ~64..127 to keep drums present even at low velocity
         amp = 60 + (vel * 63) / 127;
@@ -706,8 +707,67 @@ static void set_volume(int voice) {
 
 // Voices
 #ifdef MOP_STATS
-static unsigned long stat_cut, stat_steal2, stat_dropped;
+static unsigned long stat_cut, stat_steal2, stat_dropped, stat_hot, stat_faded;
 #endif
+
+/*
+ * How loud a voice is right now, read from the chip: the lowest
+ * attenuation of its audible operators, in 0.1875 dB steps
+ * (0 = loudest, >= 511 = silent). Opal documents egOut for this use.
+ * OPL voice v is Opal channel v.
+ */
+#define ATTEN_SILENT 511
+#define ATTEN_QUIET  320	// 60 dB down: reusing the voice will not click
+
+static int voice_atten(int v) {
+    const OpalChannel *c = &chip.chan[v];
+    int a = chip.op[c->opSlot[1]].egOut;	// carrier
+
+    if (!voices[v].ins)
+        return ATTEN_SILENT;
+    if ((voices[v].ins->v[voices[v].sub].c0 & 1) && chip.op[c->opSlot[0]].egOut < a)
+        a = chip.op[c->opSlot[0]].egOut;	// additive: the modulator is heard too
+    return a < ATTEN_SILENT ? a : ATTEN_SILENT;
+}
+
+/*
+ * Fade out what a voice still plays before reusing it. Starting a note on
+ * a voice that can still be heard restarts the waveform and clicks.
+ * Set the fastest release rate (from full level to -60 dB in 1.6 ms),
+ * key off, then hold the following writes back by about 2 ms: the write
+ * buffer spaces writes OPAL_WRITEBUF_DELAY chip samples apart, so
+ * repeating the key-off write FADE_WRITES times is a delay.
+ * At most FADE_MAX fades per instant, so a chord is delayed by at most
+ * about 6 ms.
+ */
+#define FADE_WRITES 50
+#define FADE_MAX    3
+static int fades_now;	// fades since audio was last rendered
+
+static void fade_voice(int v) {
+    const OPVOICE *ov = &voices[v].ins->v[voices[v].sub];
+    int i;
+
+    if (fades_now >= FADE_MAX)
+        return;
+    fades_now++;
+#ifdef MOP_STATS
+    stat_faded++;
+#endif
+    adlib_write(MODR(v, 0x80), (uint8_t)(ov->mod[3] | 0x0f));
+    adlib_write(CARR(v, 0x80), (uint8_t)(ov->car[3] | 0x0f));
+    for (i = 0; i < FADE_WRITES; i++)
+        voice_key(v, 0);
+}
+
+// Is voice a a better choice to (re)use than voice b: quieter, or as quiet and older
+static int quieter(int a, int b) {
+    int la = voice_atten(a), lb = voice_atten(b);
+
+    if (la != lb)
+        return la > lb;
+    return voices[a].age < voices[b].age;
+}
 
 static void voice_free(int v) {
     if (voices[v].ins)
@@ -718,17 +778,18 @@ static void voice_free(int v) {
 }
 
 /*
- * Find a voice. If none is free and may_steal is set, steal one:
- * second voices of double-voice instruments first (the note goes on with
- * its first voice), then sustain-held voices, then the oldest.
+ * Find a voice: the quietest free voice, so a new note does not start on
+ * a voice whose release can still be heard (that clicks). If none is free
+ * and may_steal is set, steal one: second voices of double-voice
+ * instruments first (the note goes on with its first voice), then
+ * sustain-held voices, then the oldest.
  * Returns -1 if none is free and may_steal is 0.
  */
 static int alloc_voice(int may_steal) {
     int i, best = -1;
 
-    // free voice that has been silent longest
     for (i = 0; i < MAX_VOICES; i++)
-        if (!voices[i].active && (best < 0 || voices[i].age < voices[best].age))
+        if (!voices[i].active && (best < 0 || quieter(i, best)))
             best = i;
     if (best >= 0 || !may_steal)
         return best;
@@ -749,6 +810,7 @@ static int alloc_voice(int may_steal) {
             if (a->released > b->released)
                 best = i;
         } else if (a->age < b->age) {
+            // by age: a note still in its attack reads as quiet
             best = i;
         }
     }
@@ -764,11 +826,12 @@ static int alloc_voice(int may_steal) {
     return best;
 }
 
-static int free_voices(void) {
+// Free voices that are silent enough to start a note on without a click
+static int quiet_voices(void) {
     int i, n = 0;
 
     for (i = 0; i < MAX_VOICES; i++)
-        n += !voices[i].active;
+        n += !voices[i].active && voice_atten(i) >= ATTEN_QUIET;
     return n;
 }
 
@@ -795,7 +858,7 @@ static void note_on(int channel, int note, int velocity) {
     for (i = 0; i < n; i++) {
         int v;
 
-        if (i == 1 && free_voices() <= SECOND_VOICE_RESERVE) {
+        if (i == 1 && quiet_voices() <= SECOND_VOICE_RESERVE) {
 #ifdef MOP_STATS
             stat_dropped++;
 #endif
@@ -808,6 +871,12 @@ static void note_on(int channel, int note, int velocity) {
             stat_dropped++;
 #endif
             break;
+        }
+        if (voice_atten(v) < ATTEN_QUIET) {
+#ifdef MOP_STATS
+            stat_hot++;
+#endif
+            fade_voice(v);	// still uses the old instrument and note
         }
         voices[v].active = 1;
         voices[v].released = 0;
@@ -924,6 +993,7 @@ static void render_samples(uint64_t samples) {
         size_t n = samples > AUDIO_BUFFER ? AUDIO_BUFFER : (size_t)samples;
 
         adlib_getsample(buffer, n);
+        fades_now = 0;
         if (audio_write(buffer, (int)n) < 0) {
             perror("audio_write");
             exit(1);
@@ -1325,8 +1395,9 @@ int main(int argc, char **argv) {
     audio_close();
     tml_free(song);	// file_buffer was already freed after loading
 #ifdef MOP_STATS
-    fprintf(stderr, "notes cut: %lu, second voices stolen: %lu, second voices not started: %lu\n",
-            stat_cut, stat_steal2, stat_dropped);
+    fprintf(stderr, "notes cut: %lu, second voices stolen: %lu, second voices not started: %lu, "
+            "voices reused while audible: %lu (faded: %lu)\n",
+            stat_cut, stat_steal2, stat_dropped, stat_hot, stat_faded);
 #endif
     return 0;
 	}	
