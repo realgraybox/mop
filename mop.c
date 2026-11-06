@@ -126,6 +126,15 @@ static void adlib_getsample(int16_t *buf, Bits n) {
 #define SYNTH_CHANNELS 	2	// physical output is always stereo
 
 /*
+ * A second voice only starts when more than this many voices are free,
+ * so a busy song keeps voices for new notes instead of starting second
+ * voices that the next notes steal again.
+ */
+#ifndef SECOND_VOICE_RESERVE
+#define SECOND_VOICE_RESERVE 2
+#endif
+
+/*
  * Internal instrument format.
  *
  * Every bank format is converted to this at load time, so the synth code
@@ -631,8 +640,14 @@ static void opl_note(int voice, int note, int bend, int on) {
  * Key a voice on or off at its instrument's pitch:
  * the MIDI key (or the fixed note) plus the voice's base note offset,
  * plus the channel pitch bend. The second voice of a double-voice
- * instrument is also detuned by the fine tuning byte, which works like a
- * pitch bend: 129 = +128, 130 = +256 (Doom Wiki).
+ * instrument is also detuned by the fine tuning byte, 1/64 semitone per
+ * step from 128. The Doom Wiki only says it works "like a pitch bend"
+ * (0x82 = +256); the scale is taken from the bank data: Overdriven Guitar
+ * has offsets -12/+2 and fine 6, so 1/64 puts its second voice 9 cents
+ * above the octave, where 1/32 would put it 1.8 semitones flat.
+ *
+ * Notes outside 0..127 fold back by octaves, as DMX folds notes outside
+ * its range (large negative offsets reach below 0).
  */
 static void voice_key(int v, int on) {
     const VOICE *vc = &voices[v];
@@ -642,7 +657,11 @@ static void voice_key(int v, int on) {
 
     note += in->v[vc->sub].offset;
     if (vc->sub)
-        bend += ((int)in->fine - 128) * 128;
+        bend += ((int)in->fine - 128) * 64;	// 8192 = 2 semitones
+    while (note < 0)
+        note += 12;
+    while (note > 127)
+        note -= 12;
     opl_note(v, note, bend, on);
 }
 
@@ -655,8 +674,13 @@ static uint8_t scale_level(uint8_t reg40, int att) {
     return (uint8_t)((reg40 & 0xc0) | level);
 }
 
+/*
+ * DMX plays both carriers of a double-voice instrument at the level of the
+ * first voice's carrier (Doom Wiki), and OP2 banks are made for that.
+ */
 static void set_volume(int voice) {
     const OPVOICE *ov = &voices[voice].ins->v[voices[voice].sub];
+    const OPVOICE *ov0 = &voices[voice].ins->v[0];
     int amp;
     int att;
 
@@ -674,7 +698,7 @@ static void set_volume(int voice) {
     // Convert amplitude to additional TL attenuation
     att = (127 - amp) * 63 / 127;
 
-    adlib_write(CARR(voice, 0x40), scale_level(ov->car[1], att));
+    adlib_write(CARR(voice, 0x40), scale_level((uint8_t)((ov->car[1] & 0xc0) | (ov0->car[1] & 0x3f)), att));
     // Additive connection: the modulator is heard directly, so scale it too
     if (ov->c0 & 1)
         adlib_write(MODR(voice, 0x40), scale_level(ov->mod[1], att));
@@ -682,7 +706,7 @@ static void set_volume(int voice) {
 
 // Voices
 #ifdef MOP_STATS
-static unsigned long stat_steals, stat_dropped;
+static unsigned long stat_cut, stat_steal2, stat_dropped;
 #endif
 
 static void voice_free(int v) {
@@ -695,9 +719,9 @@ static void voice_free(int v) {
 
 /*
  * Find a voice. If none is free and may_steal is set, steal one:
- * sustain-held voices first, then second voices of double-voice
- * instruments, then the oldest. Returns -1 if none is free and
- * may_steal is 0.
+ * second voices of double-voice instruments first (the note goes on with
+ * its first voice), then sustain-held voices, then the oldest.
+ * Returns -1 if none is free and may_steal is 0.
  */
 static int alloc_voice(int may_steal) {
     int i, best = -1;
@@ -709,10 +733,6 @@ static int alloc_voice(int may_steal) {
     if (best >= 0 || !may_steal)
         return best;
 
-#ifdef MOP_STATS
-    stat_steals++;
-#endif
-
     for (i = 0; i < MAX_VOICES; i++) {
         const VOICE *a = &voices[i];
         const VOICE *b;
@@ -722,19 +742,34 @@ static int alloc_voice(int may_steal) {
             continue;
         }
         b = &voices[best];
-        if (a->released != b->released) {
-            if (a->released > b->released)
-                best = i;
-        } else if (a->sub != b->sub) {
+        if (a->sub != b->sub) {
             if (a->sub > b->sub)
+                best = i;
+        } else if (a->released != b->released) {
+            if (a->released > b->released)
                 best = i;
         } else if (a->age < b->age) {
             best = i;
         }
     }
 
+#ifdef MOP_STATS
+    if (voices[best].sub)
+        stat_steal2++;
+    else
+        stat_cut++;
+#endif
+
     voice_free(best);
     return best;
+}
+
+static int free_voices(void) {
+    int i, n = 0;
+
+    for (i = 0; i < MAX_VOICES; i++)
+        n += !voices[i].active;
+    return n;
 }
 
 static void note_on(int channel, int note, int velocity) {
@@ -758,7 +793,15 @@ static void note_on(int channel, int note, int velocity) {
      */
     n = (ins->flags & INST_DOUBLE) ? 2 : 1;
     for (i = 0; i < n; i++) {
-        int v = alloc_voice(i == 0);
+        int v;
+
+        if (i == 1 && free_voices() <= SECOND_VOICE_RESERVE) {
+#ifdef MOP_STATS
+            stat_dropped++;
+#endif
+            break;
+        }
+        v = alloc_voice(i == 0);
 
         if (v < 0) {
 #ifdef MOP_STATS
@@ -1282,7 +1325,8 @@ int main(int argc, char **argv) {
     audio_close();
     tml_free(song);	// file_buffer was already freed after loading
 #ifdef MOP_STATS
-    fprintf(stderr, "voice steals: %lu, second voices dropped: %lu\n", stat_steals, stat_dropped);
+    fprintf(stderr, "notes cut: %lu, second voices stolen: %lu, second voices not started: %lu\n",
+            stat_cut, stat_steal2, stat_dropped);
 #endif
     return 0;
 	}	

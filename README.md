@@ -51,8 +51,10 @@ libraries below and your audio device.
   `#OPL_II#` header. The OP2 loader follows the
   [Doom Wiki GENMIDI page](https://doomwiki.org/wiki/GENMIDI).
 - **Double-voice instruments** — the second voice is optional: it only takes
-  a free OPL voice and never steals one, so under load a note falls back to
-  its first voice instead of cutting off another note.
+  a free OPL voice and never steals one, and only when more than
+  `SECOND_VOICE_RESERVE` voices are free. When stealing, second voices go
+  first, so under load a note loses its second voice instead of another
+  note being cut off.
 
 ## Building
 
@@ -71,7 +73,8 @@ Extra `CFLAGS` options:
 | Define | Effect |
 |--------|--------|
 | `-DNO_BNK` | Leave out the BNK loader (OP2 only; the built-in bank must be `.op2`) |
-| `-DMOP_STATS` | Print voice steals and dropped second voices after playback |
+| `-DMOP_STATS` | Print notes cut, second voices stolen and second voices not started after playback |
+| `-DSECOND_VOICE_RESERVE=n` | Start a second voice only when more than n voices are free (default 2) |
 ## Usage
 
 ```sh
