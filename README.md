@@ -55,6 +55,9 @@ libraries below and your audio device.
   `SECOND_VOICE_RESERVE` voices are free and silent. When stealing, second
   voices go first, so under load a note loses its second voice instead of
   another note being cut off.
+- **Two OPL3 chips** — by default mop emulates two chips (36 voices) and
+  mixes them. With double-voice OP2 banks one chip runs out of voices in
+  dense General MIDI songs; `-DCHIPS=1` gives the single-chip setup.
 - **Click-free voice reuse** — a new note takes the quietest free voice,
   read from the chip's envelope state. If that voice can still be heard,
   it is faded out in about 2 ms (fastest release, then a short delay
@@ -79,6 +82,7 @@ Extra `CFLAGS` options:
 
 | Define | Effect |
 |--------|--------|
+| `-DCHIPS=n` | Number of emulated OPL3 chips, 18 voices each (default 2; 1 is the authentic setup) |
 | `-DNO_BNK` | Leave out the BNK loader (OP2 only; the built-in bank must be `.op2`) |
 | `-DMOP_STATS` | Print notes cut, second voices stolen and not started, and voices reused while still audible, after playback |
 | `-DSECOND_VOICE_RESERVE=n` | Start a second voice only when more than n voices are free and silent (default 1) |
@@ -125,7 +129,9 @@ Extra `CFLAGS` options:
 
 - No SysEx or meta-event handling beyond tempo (lyrics/text/markers are
   parsed but discarded, since `tml.h` doesn't surface them)
-- 18-voice polyphony ceiling — dense arrangements will still steal voices
+- 36-voice polyphony with two chips (18 with one) — the densest
+  arrangements can still use them all, and double-voice instruments then
+  play with one voice
 - No General MIDI loudness normalization; playback volume follows
   whatever each file's CC7/velocity data specifies
 

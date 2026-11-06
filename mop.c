@@ -88,31 +88,49 @@
 
 typedef int Bits;
 
-static Opal chip;
+/*
+ * Number of emulated OPL3 chips, 18 voices each. Two chips (36 voices) let
+ * double-voice instruments play both voices in dense songs. The chips are
+ * mixed into one output; one chip is the authentic setup.
+ */
+#ifndef CHIPS
+#define CHIPS 2
+#endif
+
+static Opal chip[CHIPS];
 
 static void adlib_init(uint32_t rate) {
-    opalInit(&chip, (int)rate);
+    for (int c = 0; c < CHIPS; c++)
+        opalInit(&chip[c], (int)rate);
 }
 
+// reg bits 10 and up select the chip, see CHIP() below
 static void adlib_write(uint32_t reg, uint8_t val) {
     // buffered: writes are spaced like on real hardware, immediate writes sound uneven
-    opalWriteRegBuffered(&chip, (uint16_t)reg, val);
+    opalWriteRegBuffered(&chip[reg >> 10], (uint16_t)(reg & 0x1ff), val);
 }
 
 static void adlib_getsample(int16_t *buf, Bits n) {
     for (Bits i = 0; i < n; i++) {
-        int16_t l, r;
-        opalSample(&chip, &l, &r);
-        buf[2 * i]     = l;
-        buf[2 * i + 1] = r;
+        int32_t l = 0, r = 0;
+
+        for (int c = 0; c < CHIPS; c++) {
+            int16_t cl, cr;
+            opalSample(&chip[c], &cl, &cr);
+            l += cl;
+            r += cr;
+        }
+        buf[2 * i]     = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
+        buf[2 * i + 1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
     }
 }
 
-//18 voices
-#define BANK(v)    (((v) >= 9) << 8)
-#define MODR(v, b) (BANK(v) + (b) + mod_base[(v) % 9])
-#define CARR(v, b) (BANK(v) + (b) + car_base[(v) % 9])
-#define CHR(v, b)  (BANK(v) + (b) + ((v) % 9))
+// 18 voices per chip: voice v is voice v % 18 of chip v / 18
+#define CHIP(v)    (((v) / 18) << 10)
+#define BANK(v)    (((v) % 18 >= 9) << 8)
+#define MODR(v, b) (CHIP(v) + BANK(v) + (b) + mod_base[(v) % 9])
+#define CARR(v, b) (CHIP(v) + BANK(v) + (b) + car_base[(v) % 9])
+#define CHR(v, b)  (CHIP(v) + BANK(v) + (b) + ((v) % 9))
 
 #include "audio.h"
 
@@ -121,7 +139,7 @@ static void adlib_getsample(int16_t *buf, Bits n) {
 #endif
 
 #define SAMPLE_RATE     48000	//44100
-#define MAX_VOICES 		18
+#define MAX_VOICES      (18 * CHIPS)
 #define AUDIO_BUFFER    1024	//1024
 #define SYNTH_CHANNELS 	2	// physical output is always stereo
 
@@ -714,19 +732,20 @@ static unsigned long stat_cut, stat_steal2, stat_dropped, stat_hot, stat_faded;
  * How loud a voice is right now, read from the chip: the lowest
  * attenuation of its audible operators, in 0.1875 dB steps
  * (0 = loudest, >= 511 = silent). Opal documents egOut for this use.
- * OPL voice v is Opal channel v.
+ * Voice v is Opal channel v % 18 of chip v / 18.
  */
 #define ATTEN_SILENT 511
 #define ATTEN_QUIET  320	// 60 dB down: reusing the voice will not click
 
 static int voice_atten(int v) {
-    const OpalChannel *c = &chip.chan[v];
-    int a = chip.op[c->opSlot[1]].egOut;	// carrier
+    const Opal *o = &chip[v / 18];
+    const OpalChannel *c = &o->chan[v % 18];
+    int a = o->op[c->opSlot[1]].egOut;	// carrier
 
     if (!voices[v].ins)
         return ATTEN_SILENT;
-    if ((voices[v].ins->v[voices[v].sub].c0 & 1) && chip.op[c->opSlot[0]].egOut < a)
-        a = chip.op[c->opSlot[0]].egOut;	// additive: the modulator is heard too
+    if ((voices[v].ins->v[voices[v].sub].c0 & 1) && o->op[c->opSlot[0]].egOut < a)
+        a = o->op[c->opSlot[0]].egOut;	// additive: the modulator is heard too
     return a < ATTEN_SILENT ? a : ATTEN_SILENT;
 }
 
@@ -1052,10 +1071,12 @@ static int parse_note_list(const char *str, int *notes, int max_notes) {
 
 static void chip_init(void) {
     adlib_init(SAMPLE_RATE);
-    adlib_write(0x105, 0x01); // OPL3 mode
-    adlib_write(0x104, 0x00); // no 4-operator channels
-    adlib_write(0x01, 0x20);  // waveform select (needed on OPL2, harmless on OPL3)
-    adlib_write(0xbd, 0x00);  // melodic mode
+    for (uint32_t c = 0; c < CHIPS; c++) {
+        adlib_write(c << 10 | 0x105, 0x01); // OPL3 mode
+        adlib_write(c << 10 | 0x104, 0x00); // no 4-operator channels
+        adlib_write(c << 10 | 0x01, 0x20);  // waveform select (needed on OPL2, harmless on OPL3)
+        adlib_write(c << 10 | 0xbd, 0x00);  // melodic mode
+    }
 }
 
 /*
