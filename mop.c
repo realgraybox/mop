@@ -462,6 +462,12 @@ static int load_bnk_memory(const uint8_t *buf, size_t size) {
  *     1  unused
  *     2  base note offset, signed
  *
+ * DMX plays notes an octave above standard MIDI pitch, so an offset of
+ * -12 is standard pitch; OPL3 Bank Editor adds 12 to the offsets when it
+ * reads an OP2 file. The loader does the same, so the internal offsets and
+ * fixed notes are in standard MIDI pitch. For fixed-note instruments DMX
+ * ignores the offset (ModdingWiki OP2 page).
+ *
  * 175 names of 32 bytes follow; they are not used, and the Makefile strips
  * them from the embedded bank.
  */
@@ -480,7 +486,7 @@ static void op2_operator(const uint8_t *o, uint8_t r[5]) {
 }
 
 static void op2_voice(const uint8_t *p, OPVOICE *v) {
-    int off = (int16_t)le16(p + 14);
+    int off = (int16_t)le16(p + 14) + 12;	// DMX pitch -> MIDI pitch
 
     op2_operator(p, v->mod);
     op2_operator(p + 7, v->car);
@@ -494,7 +500,7 @@ static void op2_voice(const uint8_t *p, OPVOICE *v) {
 static void op2_to_instr(const uint8_t *p, INSTR *in) {
     in->flags = (uint8_t)(le16(p) & (INST_FIXED | INST_DOUBLE));
     in->fine = p[2];
-    in->note = p[3];
+    in->note = p[3] + 12 > 127 ? 127 : p[3] + 12;	// DMX pitch -> MIDI pitch
     op2_voice(p + 4, &in->v[0]);
     op2_voice(p + 20, &in->v[1]);
 }
@@ -656,13 +662,13 @@ static void opl_note(int voice, int note, int bend, int on) {
 
 /*
  * Key a voice on or off at its instrument's pitch:
- * the MIDI key (or the fixed note) plus the voice's base note offset,
+ * the fixed note, or the MIDI key plus the voice's base note offset,
  * plus the channel pitch bend. The second voice of a double-voice
  * instrument is also detuned by the fine tuning byte, 1/64 semitone per
- * step from 128. The Doom Wiki only says it works "like a pitch bend"
- * (0x82 = +256); the scale is taken from the bank data: Overdriven Guitar
- * has offsets -12/+2 and fine 6, so 1/64 puts its second voice 9 cents
- * above the octave, where 1/32 would put it 1.8 semitones flat.
+ * step from 128 (ModdingWiki: an index offset of (fine / 2) - 64 in a
+ * table of 32 steps per semitone). The bank data agrees: Overdriven
+ * Guitar has offsets -12/+2 and fine 6, which puts its second voice
+ * 9 cents above the octave.
  *
  * Notes outside 0..127 fold back by octaves, as DMX folds notes outside
  * its range (large negative offsets reach below 0).
@@ -670,10 +676,9 @@ static void opl_note(int voice, int note, int bend, int on) {
 static void voice_key(int v, int on) {
     const VOICE *vc = &voices[v];
     const INSTR *in = vc->ins;
-    int note = (in->flags & INST_FIXED) ? in->note : vc->note;
+    int note = (in->flags & INST_FIXED) ? in->note : vc->note + in->v[vc->sub].offset;
     int bend = pitch[vc->channel];
 
-    note += in->v[vc->sub].offset;
     if (vc->sub)
         bend += ((int)in->fine - 128) * 64;	// 8192 = 2 semitones
     while (note < 0)
