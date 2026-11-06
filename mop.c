@@ -793,7 +793,35 @@ static int quieter(int a, int b) {
     return voices[a].age < voices[b].age;
 }
 
+/*
+ * An audible operator with release rate 0 never fades after key off, so
+ * the note would ring until the voice is reused. This happens when a
+ * 4-op instrument is stored as two 2-op voices (OP2): a former
+ * modulator becomes a carrier. At key off such an operator gets the
+ * release rate of its voice's carrier, else of the other voice's carrier
+ * (the 4-op instrument's own release), else 4 (about 2 s).
+ */
+static uint8_t release_rate(const INSTR *in, int sub) {
+    if (in->v[sub].car[3] & 0x0f)
+        return in->v[sub].car[3] & 0x0f;
+    if ((in->flags & INST_DOUBLE) && (in->v[!sub].car[3] & 0x0f))
+        return in->v[!sub].car[3] & 0x0f;
+    return 4;
+}
+
+static void fix_release(int v) {
+    const INSTR *in = voices[v].ins;
+    const OPVOICE *ov = &in->v[voices[v].sub];
+
+    if (!(ov->car[3] & 0x0f))
+        adlib_write(CARR(v, 0x80), (uint8_t)(ov->car[3] | release_rate(in, voices[v].sub)));
+    if ((ov->c0 & 1) && !(ov->mod[3] & 0x0f))
+        adlib_write(MODR(v, 0x80), (uint8_t)(ov->mod[3] | release_rate(in, voices[v].sub)));
+}
+
 static void voice_free(int v) {
+    if (voices[v].ins && voices[v].active)
+        fix_release(v);
     if (voices[v].ins)
         voice_key(v, 0);
     voices[v].active = 0;
