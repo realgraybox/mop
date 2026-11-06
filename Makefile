@@ -32,19 +32,36 @@ LDFLAGS ?= $(STATIC) -Wl,--gc-sections,--sort-common,-s
 LDLIBS  = -lm
 
 TARGET  = mop
-BANK    = mop.bnk
-BANKOBJ = mop.o
+
+# Built-in bank: an AdLib .bnk or a DMX .op2 (GENMIDI), e.g.
+#   make BANK=banks/GENMIDI.op2
+# Add -DNO_BNK to CFLAGS for an OP2-only build (the built-in bank must then be .op2).
+# Add -DMOP_STATS to print voice steal counts after playback.
+BANK    ?= mop.bnk
+BANKBIN = bank.bin
+BANKOBJ = bank.o
+# OP2: keep the header and 175 instruments; the names after them are not used
+OP2_DATA_SIZE = 6308
 
 SRCS    = mop.c audio/audio.c audio/pcm.c 
 
-.PHONY: all clean
+.PHONY: all clean FORCE
 
 all: $(TARGET)
 
 $(TARGET): $(SRCS) $(BANKOBJ) 
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS) $(BANKOBJ) $(LDLIBS)
 
-$(BANKOBJ): $(BANK)
+# Copy to a fixed name so the symbols are always _binary_bank_bin_*.
+# FORCE: rebuild when BANK changes on the command line.
+$(BANKBIN): $(BANK) FORCE
+	case "$(BANK)" in \
+		*.op2|*.OP2) head -c $(OP2_DATA_SIZE) "$(BANK)" > $@.tmp ;; \
+		*) cp "$(BANK)" $@.tmp ;; \
+	esac
+	cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
+$(BANKOBJ): $(BANKBIN)
 	$(OBJCOPY) \
 		-I binary \
 		-O $(ELF_FORMAT) \
@@ -52,4 +69,4 @@ $(BANKOBJ): $(BANK)
 		$< $@
 		
 clean:
-	rm -f $(TARGET) $(BANKOBJ) $(BANKOBJ1) *.o
+	rm -f $(TARGET) $(BANKOBJ) $(BANKBIN) $(BANKBIN).tmp *.o

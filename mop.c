@@ -21,27 +21,29 @@
  */
 
 /*
- * opal2play.c
+ * mop.c
  *
  * Simple MIDI -> AdLib/OPL3 in OP3-mode player using opal-opl and OSS /dev/dsp or tinyalsa.
- * 
+ *
  * # Single note
- * ./opal2play -b mop.bnk -p 1 -n 60 -d 1500
- * ./opal2play -r 00000101030F050001030F000000000001040D0700020400000001010000 -n 60 -d 1500
- * 
- * where p is program (instrument),  n note and d duration, r is the 30 byte instruction
- * 
+ * ./mop -b mop.bnk -p 1 -n 60 -d 1500
+ * ./mop -b GENMIDI.op2 -p 0 -n 60 -d 1500
+ * ./mop -r 00000101030F050001030F000000000001040D0700020400000001010000 -n 60 -d 1500
+ *
+ * where p is program (instrument),  n note and d duration, r is a raw instrument:
+ * 30 bytes (AdLib BNK) or 36 bytes (OP2) as hex
+ *
  * # C major chord (C4, E4, G4)
- * ./opal2play -b mop.bnk -p 1 -n "60,64,67" -d 1500
+ * ./mop -b mop.bnk -p 1 -n "60,64,67" -d 1500
  *
  * # G7 chord (G3, B3, D4, F4)
- * ./opal2play -b mop.bnk -p 1 -n "55,59,62,65" -d 1500
+ * ./mop -b mop.bnk -p 1 -n "55,59,62,65" -d 1500
  *
  * # Raw hex with chord
- * ./opal2play -r 00000101030F050001030F000000000001040D0700020400000001010000 -n "60,64,67" -d 1500
+ * ./mop -r 00000101030F050001030F000000000001040D0700020400000001010000 -n "60,64,67" -d 1500
  *
  * Usage:
- *     	opal2play song.mid [instruments.bnk]
+ *     	mop song.mid [instruments.bnk|instruments.op2]
  *
  * Supports:
  *     	MIDI format 0/1
@@ -56,7 +58,9 @@
  *     	tempo
  *
  * Instrument bank:
- *     	Standard AdLib BNK format.
+ *     	DMX OP2 (GENMIDI) format, detected by its "#OPL_II#" header.
+ *     	Standard AdLib BNK format (leave out with -DNO_BNK).
+ *     	Both are converted at load time to one internal format (INSTR).
  *
  * opal:
  * 	   	https://github.com/RealBitdancer/opal (MIT)
@@ -91,7 +95,8 @@ static void adlib_init(uint32_t rate) {
 }
 
 static void adlib_write(uint32_t reg, uint8_t val) {
-    opalWriteReg(&chip, (uint16_t)reg, val);
+    // buffered: writes are spaced like on real hardware, immediate writes sound uneven
+    opalWriteRegBuffered(&chip, (uint16_t)reg, val);
 }
 
 static void adlib_getsample(int16_t *buf, Bits n) {
@@ -117,47 +122,58 @@ static void adlib_getsample(int16_t *buf, Bits n) {
 
 #define SAMPLE_RATE     48000	//44100
 #define MAX_VOICES 		18
-#define MAX_PROGRAMS    256
 #define AUDIO_BUFFER    1024	//1024
-#define PERC_BASE		163	// Percussion instruments start at this index in the bank
 #define SYNTH_CHANNELS 	2	// physical output is always stereo
 
-#define EV_NOTE_ON      1
-#define EV_NOTE_OFF     2
-#define EV_PROGRAM      3
-#define EV_CONTROL      4
-#define EV_PITCH        5
-#define EV_TEMPO        6
+/*
+ * Internal instrument format.
+ *
+ * Every bank format is converted to this at load time, so the synth code
+ * only knows one layout. It follows OP2 (DMX GENMIDI), which can describe
+ * everything a BNK instrument can: a BNK instrument is an INSTR with one
+ * voice, no fixed note and a base note offset of 0.
+ */
+#define INST_FIXED   0x01	// always play inst->note
+#define INST_DOUBLE  0x04	// play both voices
 
 typedef struct {
-    uint64_t tick;
-    uint8_t type;
-    uint8_t channel;
-    uint8_t a;
-    uint8_t b;
-    uint32_t tempo;
-} MIDI_EVENT;
+    uint8_t mod[5];		// register values: 0x20, 0x40 (KSL|TL), 0x60, 0x80, 0xE0
+    uint8_t car[5];
+    uint8_t c0;			// feedback/connection, stereo bits clear
+    int8_t  offset;		// base note offset in semitones
+} OPVOICE;
 
 typedef struct {
-    uint8_t data[30];
-} BNK_INSTRUMENT;
+    uint8_t flags;
+    uint8_t fine;		// 128 = no detune; detunes the second voice like a pitch bend
+    uint8_t note;		// fixed note
+    OPVOICE v[2];
+} INSTR;
+
+#define NUM_MELODIC  128
+#define NUM_PERC     47	// GM percussion notes 35..81
+#define PERC_FIRST   35
+
+#define BANK_BNK     1
+#define BANK_OP2     2
 
 typedef struct {
-    BNK_INSTRUMENT inst[MAX_PROGRAMS];
-    int count;
+    INSTR melodic[NUM_MELODIC];
+    INSTR perc[NUM_PERC];
+    int type;			// BANK_BNK or BANK_OP2
 } BANK;
 
 typedef struct {
     int active;
     int released;
     int channel;
-    int note;
+    int note;			// MIDI key, used to match note off
     int velocity;
     unsigned long age;
-    int prog;
+    const INSTR *ins;
+    int sub;			// 0 = first voice, 1 = second voice of a double-voice instrument
 } VOICE;
 
-static MIDI_EVENT *events;
 static BANK bank;
 static VOICE voices[MAX_VOICES];
 
@@ -171,14 +187,16 @@ static int pitch[16];
 
 static unsigned long voice_age;
 
-extern const unsigned char _binary_mop_bnk_start[];
-extern const unsigned char _binary_mop_bnk_end[];
+// The embedded bank. The Makefile copies $(BANK) to bank.bin first, so the
+// symbol names stay the same whichever bank is embedded.
+extern const unsigned char _binary_bank_bin_start[];
+extern const unsigned char _binary_bank_bin_end[];
 
 
-static uint8_t percussion_program(int note) {
-    if (note < 35 || note > 81)
-        return PERC_BASE; // fallback to first drum
-    return (uint8_t)(PERC_BASE + (note - 35));
+static const INSTR *percussion_instr(int note) {
+    if (note < PERC_FIRST || note >= PERC_FIRST + NUM_PERC)
+        return &bank.perc[0]; // fallback to first drum
+    return &bank.perc[note - PERC_FIRST];
 }
 
 static int is_percussion_channel(int ch) {	// Helper to check if a channel is percussion
@@ -214,6 +232,7 @@ static uint16_t le16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
+#ifndef NO_BNK
 static uint32_t le32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -245,16 +264,93 @@ static uint32_t le32(const uint8_t *p) {
  *     1  carrier waveform
  *
  * total = 30 bytes.
+ *
+ * OPLREGS offsets inside each 13-byte operator:
+ *
+ * 0  ksl
+ * 1  multiple
+ * 2  feedback
+ * 3  attack
+ * 4  sustain
+ * 5  eg
+ * 6  decay
+ * 7  release
+ * 8  total level
+ * 9  am
+ * 10 vib
+ * 11 ksr
+ * 12 con
+ *
+ * BNK:
+ *
+ * 0..1       percussion / voice
+ * 2..14      modulator
+ * 15..27     carrier
+ * 28         mod waveform
+ * 29         carrier waveform
+ *
+ * Instrument n of the bank (in name-table order) is MIDI program n for
+ * n < 128, and drum note 35 + (n - BNK_PERC_BASE) for n >= BNK_PERC_BASE.
+ * Missing entries fall back to instrument 0.
  */
 
 #define BNK_HEADER_SIZE 28
 #define BNK_NAME_SIZE   12
 #define BNK_INST_SIZE   30
+#define BNK_MAX_INST    256
+#define BNK_PERC_BASE   163	// Percussion instruments start at this index in the bank
+
+static uint8_t opl_reg20(const uint8_t *o) {
+    return (uint8_t)(
+        ((o[9]  ? 1 : 0) << 7) |
+        ((o[10] ? 1 : 0) << 6) |
+        ((o[5]  ? 1 : 0) << 5) |
+        ((o[11] ? 1 : 0) << 4) |
+        (o[1] & 0x0f));
+}
+
+static uint8_t opl_reg40(const uint8_t *o) {
+    return (uint8_t)(((o[0] & 3) << 6) | (o[8] & 0x3f));
+}
+
+static uint8_t opl_reg60(const uint8_t *o) {
+    return (uint8_t)(((o[3] & 0x0f) << 4) | (o[6] & 0x0f));
+}
+
+static uint8_t opl_reg80(const uint8_t *o) {
+    return (uint8_t)(((o[4] & 0x0f) << 4) | (o[7] & 0x0f));
+}
+
+static uint8_t opl_regc0(const uint8_t *o) {
+    /* BNK "con" is inverted:
+     * 0    -> OPL connection bit 1
+     * other -> OPL connection bit 0
+     */
+    return (uint8_t)(((o[2] & 7) << 1) | (o[12] ? 0 : 1));
+}
+
+static void bnk_operator(const uint8_t *o, uint8_t wave, uint8_t r[5]) {
+    r[0] = opl_reg20(o);
+    r[1] = opl_reg40(o);
+    r[2] = opl_reg60(o);
+    r[3] = opl_reg80(o);
+    r[4] = wave & 7;
+}
+
+// Convert one 30-byte BNK timbre
+static void bnk_to_instr(const uint8_t *p, INSTR *in) {
+    memset(in, 0, sizeof(*in));
+    in->fine = 128;
+    bnk_operator(p + 2, p[28], in->v[0].mod);
+    bnk_operator(p + 15, p[29], in->v[0].car);
+    in->v[0].c0 = opl_regc0(p + 2);
+}
 
 static int load_bnk_memory(const uint8_t *buf, size_t size) {
     const uint8_t *hdr;
     const uint8_t *names;
     const uint8_t *data;
+    const uint8_t *list[BNK_MAX_INST];
     uint16_t num_instruments;
     uint32_t offset_name;
     uint32_t offset_data;
@@ -289,7 +385,7 @@ static int load_bnk_memory(const uint8_t *buf, size_t size) {
     names = buf + offset_name;
     data = buf + offset_data;
 
-    for (i = 0; i < num_instruments && count < MAX_PROGRAMS; i++) {
+    for (i = 0; i < num_instruments && count < BNK_MAX_INST; i++) {
 
         const uint8_t *entry;
         uint16_t midi_index;
@@ -300,18 +396,122 @@ static int load_bnk_memory(const uint8_t *buf, size_t size) {
             continue;
 
         // HMI version 0.0 banks such as melodic.bnk have valid instruments with flags == 0
-        if ((hdr[0] == 0 && hdr[1] == 0) || entry[2] != 0) {
-			if (count >= MAX_PROGRAMS)
-				break;
-            memcpy(bank.inst[count].data, data + (size_t)midi_index * BNK_INST_SIZE, BNK_INST_SIZE);
-            count++;
-        }
+        if ((hdr[0] == 0 && hdr[1] == 0) || entry[2] != 0)
+            list[count++] = data + (size_t)midi_index * BNK_INST_SIZE;
     }
-    bank.count = count;
-    return count ? 0 : -1;
+    if (!count)
+        return -1;
+
+    for (i = 0; i < NUM_MELODIC; i++)
+        bnk_to_instr(list[(int)i < count ? i : 0], &bank.melodic[i]);
+    for (i = 0; i < NUM_PERC; i++) {
+        int n = BNK_PERC_BASE + (int)i;
+        // BNK drums have no fixed note: they play at the MIDI note, as before
+        bnk_to_instr(list[n < count ? n : 0], &bank.perc[i]);
+    }
+    bank.type = BANK_BNK;
+    return 0;
+}
+#endif /* NO_BNK */
+
+// OP2
+/*
+ * DMX OP2 (GENMIDI), as described on the Doom Wiki GENMIDI page:
+ *
+ * header:
+ *     8  "#OPL_II#"
+ *
+ * 175 instruments of 36 bytes (0-127 melodic, 128-174 drum notes 35-81):
+ *     2  flags (bit 0 fixed pitch, bit 2 double voice)
+ *     1  fine tuning of the second voice (128 = none, works like pitch bend)
+ *     1  fixed note
+ *    16  voice 1
+ *    16  voice 2
+ *
+ * voice:
+ *     6  modulator: 0x20, 0x60, 0x80, waveform, KSL, level
+ *     1  feedback/connection (0xC0)
+ *     6  carrier, same layout
+ *     1  unused
+ *     2  base note offset, signed
+ *
+ * 175 names of 32 bytes follow; they are not used, and the Makefile strips
+ * them from the embedded bank.
+ */
+
+#define OP2_HEADER_SIZE 8
+#define OP2_INST_SIZE   36
+#define OP2_NUM_INST    (NUM_MELODIC + NUM_PERC)
+#define OP2_DATA_SIZE   (OP2_HEADER_SIZE + OP2_NUM_INST * OP2_INST_SIZE)	// 6308
+
+static void op2_operator(const uint8_t *o, uint8_t r[5]) {
+    r[0] = o[0];
+    r[1] = (uint8_t)((o[4] & 0xc0) | (o[5] & 0x3f));
+    r[2] = o[1];
+    r[3] = o[2];
+    r[4] = o[3] & 7;
 }
 
-static int load_bnk(const char *filename) {
+static void op2_voice(const uint8_t *p, OPVOICE *v) {
+    int off = (int16_t)le16(p + 14);
+
+    op2_operator(p, v->mod);
+    op2_operator(p + 7, v->car);
+    v->c0 = p[6] & 0x0f;
+    if (off < -127) off = -127;
+    if (off > 127) off = 127;
+    v->offset = (int8_t)off;
+}
+
+// Convert one 36-byte OP2 instrument
+static void op2_to_instr(const uint8_t *p, INSTR *in) {
+    in->flags = (uint8_t)(le16(p) & (INST_FIXED | INST_DOUBLE));
+    in->fine = p[2];
+    in->note = p[3];
+    op2_voice(p + 4, &in->v[0]);
+    op2_voice(p + 20, &in->v[1]);
+}
+
+static int load_op2_memory(const uint8_t *buf, size_t size) {
+    int i;
+    const uint8_t *p = buf + OP2_HEADER_SIZE;
+
+    if (size < OP2_DATA_SIZE)
+        return -1;
+
+    for (i = 0; i < NUM_MELODIC; i++, p += OP2_INST_SIZE)
+        op2_to_instr(p, &bank.melodic[i]);
+    for (i = 0; i < NUM_PERC; i++, p += OP2_INST_SIZE)
+        op2_to_instr(p, &bank.perc[i]);
+    bank.type = BANK_OP2;
+    return 0;
+}
+
+static int load_bank_memory(const uint8_t *buf, size_t size) {
+    if (size >= OP2_HEADER_SIZE && memcmp(buf, "#OPL_II#", OP2_HEADER_SIZE) == 0)
+        return load_op2_memory(buf, size);
+#ifndef NO_BNK
+    return load_bnk_memory(buf, size);
+#else
+    return -1;
+#endif
+}
+
+/*
+ * Bank index as used by -p: 0-127 melodic, then the drums from the
+ * format's own drum base (128 for OP2, 163 for BNK).
+ */
+static const INSTR *bank_index(int idx) {
+    int perc_base = bank.type == BANK_OP2 ? NUM_MELODIC : 163;	// 163 = BNK_PERC_BASE
+
+    if (idx >= 0 && idx < NUM_MELODIC)
+        return &bank.melodic[idx];
+    if (idx >= perc_base && idx < perc_base + NUM_PERC)
+        return &bank.perc[idx - perc_base];
+    return NULL;
+}
+
+static int load_bank(const char *filename) {
     FILE *fp;
     uint8_t *buf;
     long len;
@@ -342,67 +542,12 @@ static int load_bnk(const char *filename) {
         return -1;
     }
     fclose(fp);
-    ret = load_bnk_memory(buf, (size_t)len);
+    ret = load_bank_memory(buf, (size_t)len);
     free(buf);
     return ret;
 }
 
 // OPL instrument
-/*
- * OPLREGS offsets inside each 13-byte operator:
- *
- * 0  ksl
- * 1  multiple
- * 2  feedback
- * 3  attack
- * 4  sustain
- * 5  eg
- * 6  decay
- * 7  release
- * 8  total level
- * 9  am
- * 10 vib
- * 11 ksr
- * 12 con
- *
- * BNK:
- *
- * 0..1       percussion / voice
- * 2..14      modulator
- * 15..27     carrier
- * 28         mod waveform
- * 29         carrier waveform
- */
-
-static uint8_t opl_reg20(const uint8_t *o) {
-    return (uint8_t)(
-        ((o[9]  ? 1 : 0) << 7) |
-        ((o[10] ? 1 : 0) << 6) |
-        ((o[5]  ? 1 : 0) << 5) |
-        ((o[11] ? 1 : 0) << 4) |
-        (o[1] & 0x0f));
-}
-
-static uint8_t opl_reg40(const uint8_t *o) {
-    return (uint8_t)(((o[0] & 3) << 6) | (o[8] & 0x3f));
-}
-
-static uint8_t opl_reg60(const uint8_t *o) {
-    return (uint8_t)(((o[3] & 0x0f) << 4) | (o[6] & 0x0f));
-}
-
-static uint8_t opl_reg80(const uint8_t *o) {
-    return (uint8_t)(((o[4] & 0x0f) << 4) | (o[7] & 0x0f));
-}
-
-static uint8_t opl_regc0(const uint8_t *o) {
-    /* BNK "con" is inverted:
-     * 0    -> OPL connection bit 1
-     * other -> OPL connection bit 0
-     */
-    return (uint8_t)(((o[2] & 7) << 1) | (o[12] ? 0 : 1));
-}
-
 static int pan_to_stereo_mode(uint8_t pan_val) {
     if (pan_val < 48)
         return 1; // left only
@@ -411,45 +556,31 @@ static int pan_to_stereo_mode(uint8_t pan_val) {
     return 3;     // center (both)
 }
 
-static void load_opl_instrument(int voice, int prog, int channel) {
-	(void)channel;
-    const uint8_t *p;
-    const uint8_t *mod;
-    const uint8_t *car;
-		
-    if (prog < 0 || prog >= bank.count)
-        prog = 0;
+static void load_opl_instrument(int voice) {
+    const OPVOICE *ov = &voices[voice].ins->v[voices[voice].sub];
+    int channel = voices[voice].channel;
+    uint8_t con;
+    int mode;
 
-    p = bank.inst[prog].data;
+    adlib_write(MODR(voice, 0x20), ov->mod[0]);
+    adlib_write(MODR(voice, 0x40), ov->mod[1]);
+    adlib_write(MODR(voice, 0x60), ov->mod[2]);
+    adlib_write(MODR(voice, 0x80), ov->mod[3]);
+    adlib_write(MODR(voice, 0xe0), ov->mod[4]);
 
-    mod = p + 2;
-    car = p + 15;
+    adlib_write(CARR(voice, 0x20), ov->car[0]);
+    adlib_write(CARR(voice, 0x40), ov->car[1]);
+    adlib_write(CARR(voice, 0x60), ov->car[2]);
+    adlib_write(CARR(voice, 0x80), ov->car[3]);
+    adlib_write(CARR(voice, 0xe0), ov->car[4]);
 
-    adlib_write(MODR(voice, 0x20), opl_reg20(mod));
-    adlib_write(MODR(voice, 0x40), opl_reg40(mod));
-    adlib_write(MODR(voice, 0x60), opl_reg60(mod));
-    adlib_write(MODR(voice, 0x80), opl_reg80(mod));
-    adlib_write(MODR(voice, 0xe0), p[28] & 7);
-
-    adlib_write(CARR(voice, 0x20), opl_reg20(car));
-    adlib_write(CARR(voice, 0x40), opl_reg40(car));
-    adlib_write(CARR(voice, 0x60), opl_reg60(car));
-    adlib_write(CARR(voice, 0x80), opl_reg80(car));
-    adlib_write(CARR(voice, 0xe0), p[29] & 7);
-
-
-	uint8_t con;
-    con = opl_regc0(mod);
-    
     // Add stereo select bits based on channel pan
-    int mode = pan_to_stereo_mode(pan[channel]);
-    // Clear old stereo bits (4 and 5)
-    con &= ~0x30;	//needed?
-	if (mode & 1) con |= 0x10; // left
-	if (mode & 2) con |= 0x20; // right
-	adlib_write(CHR(voice, 0xc0), con);
+    con = ov->c0 & 0x0f;
+    mode = pan_to_stereo_mode(pan[channel]);
+    if (mode & 1) con |= 0x10; // left
+    if (mode & 2) con |= 0x20; // right
+    adlib_write(CHR(voice, 0xc0), con);
 }
-
 // OPL note frequency
 static void note_frequency(int note, int bend, int *fnum, int *block) {
     double semitones;
@@ -496,15 +627,38 @@ static void opl_note(int voice, int note, int bend, int on) {
     adlib_write(CHR(voice, 0xb0), ((fnum >> 8) & 3) | ((block & 7) << 2) | (on ? 0x20 : 0));
 }
 
-// Volume
-static void set_volume(int voice) {
-    const uint8_t *p;
-    const uint8_t *car;
-    int level;
-    int amp;
+/*
+ * Key a voice on or off at its instrument's pitch:
+ * the MIDI key (or the fixed note) plus the voice's base note offset,
+ * plus the channel pitch bend. The second voice of a double-voice
+ * instrument is also detuned by the fine tuning byte, which works like a
+ * pitch bend: 129 = +128, 130 = +256 (Doom Wiki).
+ */
+static void voice_key(int v, int on) {
+    const VOICE *vc = &voices[v];
+    const INSTR *in = vc->ins;
+    int note = (in->flags & INST_FIXED) ? in->note : vc->note;
+    int bend = pitch[vc->channel];
 
-    p = bank.inst[voices[voice].prog].data;
-    car = p + 15;
+    note += in->v[vc->sub].offset;
+    if (vc->sub)
+        bend += ((int)in->fine - 128) * 128;
+    opl_note(v, note, bend, on);
+}
+
+// Volume
+static uint8_t scale_level(uint8_t reg40, int att) {
+    int level = (reg40 & 63) + att;
+
+    if (level > 63)
+        level = 63;
+    return (uint8_t)((reg40 & 0xc0) | level);
+}
+
+static void set_volume(int voice) {
+    const OPVOICE *ov = &voices[voice].ins->v[voices[voice].sub];
+    int amp;
+    int att;
 
     if (is_percussion_channel(voices[voice].channel)) {
         // Percussion: ignore channel volume/expression, use velocity only,
@@ -518,140 +672,151 @@ static void set_volume(int voice) {
         amp = amp * voices[voice].velocity / 127;
     }
     // Convert amplitude to additional TL attenuation
-    level = car[8] & 63;
-    level += (127 - amp) * 63 / 127;
+    att = (127 - amp) * 63 / 127;
 
-    if (level > 63)
-        level = 63;
-
-	adlib_write(CARR(voice, 0x40), ((car[0] & 3) << 6) | level);
+    adlib_write(CARR(voice, 0x40), scale_level(ov->car[1], att));
+    // Additive connection: the modulator is heard directly, so scale it too
+    if (ov->c0 & 1)
+        adlib_write(MODR(voice, 0x40), scale_level(ov->mod[1], att));
 }
 
 // Voices
-static int find_voice(int channel, int note) {
-    int i;
-
-    for (i = 0; i < MAX_VOICES; i++) {
-        if (voices[i].active &&
-            voices[i].channel == channel &&
-            voices[i].note == note)
-            return i;
-    }
-    return -1;
-}
+#ifdef MOP_STATS
+static unsigned long stat_steals, stat_dropped;
+#endif
 
 static void voice_free(int v) {
-    opl_note(v, voices[v].note, pitch[voices[v].channel], 0);
+    if (voices[v].ins)
+        voice_key(v, 0);
     voices[v].active = 0;
     voices[v].released = 0;
     voices[v].age = ++voice_age;   // age now = time of release
 }
 
-static int alloc_voice(void) {
+/*
+ * Find a voice. If none is free and may_steal is set, steal one:
+ * sustain-held voices first, then second voices of double-voice
+ * instruments, then the oldest. Returns -1 if none is free and
+ * may_steal is 0.
+ */
+static int alloc_voice(int may_steal) {
     int i, best = -1;
 
     // free voice that has been silent longest
     for (i = 0; i < MAX_VOICES; i++)
         if (!voices[i].active && (best < 0 || voices[i].age < voices[best].age))
             best = i;
-    if (best >= 0)
+    if (best >= 0 || !may_steal)
         return best;
-        
-    // debug
-    // static unsigned steals;
-	// steals++; fprintf(stderr, "steal #%u\n", steals);
 
-    // steal: sustain-held voices first, then the oldest
-    for (i = 0; i < MAX_VOICES; i++)
-        if (best < 0 ||
-            voices[i].released > voices[best].released ||
-            (voices[i].released == voices[best].released &&
-             voices[i].age < voices[best].age))
+#ifdef MOP_STATS
+    stat_steals++;
+#endif
+
+    for (i = 0; i < MAX_VOICES; i++) {
+        const VOICE *a = &voices[i];
+        const VOICE *b;
+
+        if (best < 0) {
             best = i;
+            continue;
+        }
+        b = &voices[best];
+        if (a->released != b->released) {
+            if (a->released > b->released)
+                best = i;
+        } else if (a->sub != b->sub) {
+            if (a->sub > b->sub)
+                best = i;
+        } else if (a->age < b->age) {
+            best = i;
+        }
+    }
 
     voice_free(best);
     return best;
 }
 
 static void note_on(int channel, int note, int velocity) {
-    int v;
-	int prog;
+    const INSTR *ins;
+    int i, n;
 
-    v = find_voice(channel, note);
+    // retrigger: release whatever still plays this key
+    for (i = 0; i < MAX_VOICES; i++)
+        if (voices[i].active && voices[i].channel == channel && voices[i].note == note)
+            voice_free(i);
 
-    if (v >= 0) {
-        opl_note(v, note, pitch[channel], 0);
-        voices[v].active = 0;
+    if (is_percussion_channel(channel))
+        ins = percussion_instr(note);	// Ignore program[channel]
+    else
+        ins = &bank.melodic[program[channel]];
+
+    /*
+     * The second voice of a double-voice instrument is optional: it only
+     * takes a free voice and never steals one. Without a free voice the
+     * note plays with its first voice alone.
+     */
+    n = (ins->flags & INST_DOUBLE) ? 2 : 1;
+    for (i = 0; i < n; i++) {
+        int v = alloc_voice(i == 0);
+
+        if (v < 0) {
+#ifdef MOP_STATS
+            stat_dropped++;
+#endif
+            break;
+        }
+        voices[v].active = 1;
+        voices[v].released = 0;
+        voices[v].channel = channel;
+        voices[v].note = note;
+        voices[v].velocity = velocity;
+        voices[v].age = ++voice_age;
+        voices[v].ins = ins;
+        voices[v].sub = i;
+
+        load_opl_instrument(v);
+        set_volume(v);
+        voice_key(v, 1);
     }
-
-    v = alloc_voice();
- 
-	if (is_percussion_channel(channel)) {
-		// Ignore program[channel]
-		prog = percussion_program(note);
-    } else {
-        prog = program[channel];
-        if (prog >= bank.count)
-            prog = 0;
-    }
-    load_opl_instrument(v, prog, channel);
-
-    voices[v].active = 1;
-    voices[v].released = 0;
-    voices[v].channel = channel;
-    voices[v].note = note;
-    voices[v].velocity = velocity;
-    voices[v].age = ++voice_age;
-    voices[v].prog = prog;
-    
-    set_volume(v);
-    opl_note(v, note, pitch[channel], 1);
 }
 
 static void note_off(int channel, int note) {
-    int v;
-    v = find_voice(channel, note);
+    int i;
 
-    if (v < 0)
-        return;
-
-    if (sustain[channel] >= 64) {
-        voices[v].released = 1;
-        return;
+    for (i = 0; i < MAX_VOICES; i++) {
+        if (!voices[i].active || voices[i].released ||
+            voices[i].channel != channel || voices[i].note != note)
+            continue;
+        if (sustain[channel] >= 64)
+            voices[i].released = 1;
+        else
+            voice_free(i);
     }
-    opl_note(v, note, pitch[channel], 0);
-    voices[v].active = 0;
 }
 
 static void release_sustain(int channel) {
     int i;
 
-    for (i = 0; i < MAX_VOICES; i++) {
-        if (voices[i].active && voices[i].channel == channel && voices[i].released) {
-            opl_note(i, voices[i].note, pitch[channel], 0);
-            voices[i].active = 0;
-        }
-    }
+    for (i = 0; i < MAX_VOICES; i++)
+        if (voices[i].active && voices[i].channel == channel && voices[i].released)
+            voice_free(i);
 }
 
 static void all_notes_off(int channel) {
     int i;
-    for (i = 0; i < MAX_VOICES; i++) {
-        if (voices[i].active && voices[i].channel == channel) {
-            opl_note(i, voices[i].note, pitch[channel], 0);
-            voices[i].active = 0;
-        }
-    }
+
+    for (i = 0; i < MAX_VOICES; i++)
+        if (voices[i].active && voices[i].channel == channel)
+            voice_free(i);
 }
 
 static void set_pitch(int channel, int value) {
     int i;
     pitch[channel] = value - 8192;
-    for (i = 0; i < MAX_VOICES; i++) {
-        if (voices[i].active && voices[i].channel == channel) {
-            opl_note(i, voices[i].note, pitch[channel], 1);
-        }
-    }
+    for (i = 0; i < MAX_VOICES; i++)
+        if (voices[i].active && voices[i].channel == channel)
+            voice_key(i, 1);
 }
 
 static void process_event(const struct tml_message *m) {
@@ -669,11 +834,8 @@ static void process_event(const struct tml_message *m) {
         note_off(ch, m->key);
         break;
     case TML_PROGRAM_CHANGE:
-        if (!is_percussion_channel(ch)) {
-            program[ch] = m->program;
-            if (program[ch] >= bank.count)
-                program[ch] = 0;
-        }
+        if (!is_percussion_channel(ch))
+            program[ch] = m->program & (NUM_MELODIC - 1);
         break;
     case TML_CONTROL_CHANGE:
         switch (m->control) {
@@ -775,140 +937,39 @@ static int parse_note_list(const char *str, int *notes, int max_notes) {
     return count;
 }
 
-static void test_play_chord(const uint8_t inst_data[30], const int *notes, int note_count, int duration_ms) {
+static void chip_init(void) {
+    adlib_init(SAMPLE_RATE);
+    adlib_write(0x105, 0x01); // OPL3 mode
+    adlib_write(0x104, 0x00); // no 4-operator channels
+    adlib_write(0x01, 0x20);  // waveform select (needed on OPL2, harmless on OPL3)
+    adlib_write(0xbd, 0x00);  // melodic mode
+}
+
+/*
+ * Test mode: play one instrument as a single note or a chord through the
+ * normal note_on/note_off path, so double voices, fixed notes and voice
+ * allocation behave exactly as in playback.
+ */
+static void test_play(const INSTR *ins, const int *notes, int note_count, int duration_ms) {
+    int i;
+
     if (note_count <= 0 || note_count > MAX_VOICES) {
         fprintf(stderr, "Invalid chord: %d notes (max %d)\n", note_count, MAX_VOICES);
         return;
     }
 
-    // 1. Copy instrument to bank slot 0
-    memcpy(bank.inst[0].data, inst_data, 30);
-    bank.count = 1;
-
-    // 2. Chip & Mode Init
-    adlib_init(SAMPLE_RATE);
-
-    adlib_write(0x105, 0x01); // OPL3 mode
-    adlib_write(0x01, 0x20);  // Waveform Select
-    adlib_write(0xBD, 0x00);  // Melodic mode
-
-    // 3. Channel & Voice state
+    // The instrument goes into melodic slot 0, played on channel 0
+    bank.melodic[0] = *ins;
     init_state();
-    volume[0] = 127;
-    expression[0] = 127;
-    pan[0] = 64; // Center
-    pitch[0] = 0;
+    chip_init();
 
-    // 4. Allocate voices and key on each note
-    for (int i = 0; i < note_count; i++) {
-        int v = i; // Use voices 0,1,2,... for chord notes
+    for (i = 0; i < note_count; i++)
+        note_on(0, notes[i], 127);
+    render_samples(((uint64_t)duration_ms * SAMPLE_RATE) / 1000);
 
-        voices[v].active = 1;
-        voices[v].released = 0;
-        voices[v].channel = 0;
-        voices[v].note = notes[i];
-        voices[v].velocity = 127;
-        voices[v].prog = 0;
-
-        load_opl_instrument(v, 0, 0);
-        set_volume(v);
-        opl_note(v, notes[i], 0, 1);
-    }
-
-    // 5. Audio loop: Hold duration
-    uint64_t hold_frames = ((uint64_t)duration_ms * SAMPLE_RATE) / 1000;
-    uint64_t release_frames = ((uint64_t)500 * SAMPLE_RATE) / 1000;
-    uint64_t total_frames = hold_frames + release_frames;
-    uint64_t rendered = 0;
-    int keyed_off = 0;
-
-    while (rendered < total_frames) {
-        if (!keyed_off && rendered >= hold_frames) {
-            // Key off all chord voices
-            for (int i = 0; i < note_count; i++) {
-                opl_note(i, notes[i], 0, 0);
-            }
-            keyed_off = 1;
-        }
-
-        uint64_t remaining = total_frames - rendered;
-        size_t n = remaining > AUDIO_BUFFER ? AUDIO_BUFFER : (size_t)remaining;
-
-        int16_t buffer[AUDIO_BUFFER * 2];
-        adlib_getsample(buffer, (Bits)n);
-
-        if (audio_write(buffer, (int)n) < 0) {
-            perror("audio_write");
-            exit(1);
-        }
-
-        rendered += n;
-    }
-
-    // Deactivate all voices
-    for (int i = 0; i < note_count; i++) {
-        voices[i].active = 0;
-    }
-}
-
-static void test_play_instrument(const uint8_t inst_data[30], int note, int duration_ms) {
-    // 1. Copy the instrument timbre into slot 0
-    memcpy(bank.inst[0].data, inst_data, 30);
-    bank.count = 1;
-
-    // 2. Set channel 0 controller state
-    init_state();
-    volume[0] = 127;
-    expression[0] = 127;
-    pan[0] = 64; // use either 0 or 127 _NOT_ 63
-    pitch[0] = 0;
-
-	// 3. Setup voice 0
-    voices[0].active = 1;
-    voices[0].released = 0;
-    voices[0].channel = 0;
-    voices[0].note = note;
-    voices[0].velocity = 127;	// Full velocity
-    voices[0].prog = 0;
-
-    // 4. Program OPL registers & set volume attenuation
-    load_opl_instrument(0, 0, 0);
-    set_volume(0);
-
-    // 5. Key on
-    opl_note(0, note, 0, 1);
-    
-    // 6. Audio loop: Note sustain duration
-    uint64_t hold_frames = ((uint64_t)duration_ms * SAMPLE_RATE) / 1000;
-    while (hold_frames > 0) {
-        int16_t buffer[AUDIO_BUFFER * 2];
-        size_t n = hold_frames > AUDIO_BUFFER ? AUDIO_BUFFER : (size_t)hold_frames;
-        
-        adlib_getsample(buffer, (Bits)n);
-        if (audio_write(buffer, (int)n) < 0) {
-            perror("audio_write");
-            exit(1);
-        }
-        hold_frames -= n;
-    }
-
-    // 7. Key off
-    opl_note(0, note, 0, 0);
-
-    // 8. Audio loop: Release tail (500 ms)
-    uint64_t release_frames = ((uint64_t)500 * SAMPLE_RATE) / 1000;
-    while (release_frames > 0) {
-        int16_t buffer[AUDIO_BUFFER * 2];
-        size_t n = release_frames > AUDIO_BUFFER ? AUDIO_BUFFER : (size_t)release_frames;
-        
-        adlib_getsample(buffer, (Bits)n);
-        if (audio_write(buffer, (int)n) < 0) {
-            perror("audio_write");
-            exit(1);
-        }
-        release_frames -= n;
-    }
-    voices[0].active = 0;
+    for (i = 0; i < note_count; i++)
+        note_off(0, notes[i]);
+    render_samples(((uint64_t)500 * SAMPLE_RATE) / 1000);   // release tail
 }
 
 static int parse_hex_byte(char c) {
@@ -918,14 +979,31 @@ static int parse_hex_byte(char c) {
     return -1;
 }
 
-static int parse_raw_hex(const char *str, uint8_t out[30]) {
-    if (strlen(str) < 60) return -1;
-    for (int i = 0; i < 30; i++) {
+// Parse a raw instrument: 60 hex chars (30-byte BNK) or 72 (36-byte OP2)
+static int parse_raw_hex(const char *str, INSTR *out) {
+    uint8_t raw[OP2_INST_SIZE];
+    size_t len = strlen(str);
+    size_t n = len / 2;
+
+    if (len % 2 || (n != OP2_INST_SIZE
+#ifndef NO_BNK
+                    && n != BNK_INST_SIZE
+#endif
+                    ))
+        return -1;
+    for (size_t i = 0; i < n; i++) {
         int hi = parse_hex_byte(str[i * 2]);
         int lo = parse_hex_byte(str[i * 2 + 1]);
         if (hi < 0 || lo < 0) return -1;
-        out[i] = (uint8_t)((hi << 4) | lo);
+        raw[i] = (uint8_t)((hi << 4) | lo);
     }
+#ifndef NO_BNK
+    if (n == BNK_INST_SIZE) {
+        bnk_to_instr(raw, out);
+        return 0;
+    }
+#endif
+    op2_to_instr(raw, out);
     return 0;
 }
 
@@ -956,6 +1034,16 @@ unsigned char* unwrap_riff_midi(unsigned char* data, unsigned int* size) {
     return data;
 }
 
+static int load_embedded_bank(void) {
+	size_t size = (size_t)(_binary_bank_bin_end - _binary_bank_bin_start);
+
+	if (load_bank_memory(_binary_bank_bin_start, size) < 0) {
+		fprintf(stderr, "Could not load internal bank\n");
+		return -1;
+	}
+	return 0;
+}
+
 // Main
 int main(int argc, char **argv) {
 	
@@ -967,7 +1055,7 @@ int main(int argc, char **argv) {
     int test_duration = 1000;  // 1 second sustain
     int test_prog = -1;
     const char *bnk_file = NULL;
-    uint8_t raw_data[30];
+    INSTR raw_inst;
     int have_raw = 0;
 
     // Check for CLI testing flags
@@ -997,67 +1085,63 @@ int main(int argc, char **argv) {
 			test_mode = 1;
 			
 		} else if (!strcmp(argv[i], "-r") && i + 1 < argc) {
-			if (parse_raw_hex(argv[++i], raw_data) == 0) {
+			if (parse_raw_hex(argv[++i], &raw_inst) == 0) {
 				have_raw = 1;
 				test_mode = 1;
 			} else {
-				fprintf(stderr, "Invalid hex string (must be 60 hex characters for 30 bytes)\n");
+				fprintf(stderr, "Invalid hex string (must be 60 hex characters for a 30-byte BNK "
+				                "instrument or 72 for a 36-byte OP2 instrument)\n");
 				return 1;
 			}
 		}
 	}
     
 	if (test_mode) {
-		if (audio_init(SAMPLE_RATE, 2) < 0) {
-			fprintf(stderr, "Unable to initialize audio\n");
-			return 1;
-		}
-		adlib_init(SAMPLE_RATE);
-		adlib_write(0x105, 0x01); // OPL3 mode
+		const INSTR *ins = NULL;
 
-		if (have_raw || (bnk_file && test_prog >= 0)) {
-			uint8_t raw_inst[30];
-			if (have_raw) {
-				memcpy(raw_inst, raw_data, 30);
-			} else {
-				if (load_bnk(bnk_file) < 0 || test_prog >= bank.count) {
-					fprintf(stderr, "Could not load program %d from bank %s\n", test_prog, bnk_file);
-					audio_close();
-					return 1;
-				}
-				memcpy(raw_inst, bank.inst[test_prog].data, 30);
+		if (have_raw) {
+			ins = &raw_inst;
+		} else if (test_prog >= 0) {
+			// -p without -b uses the built-in bank
+			if (bnk_file ? load_bank(bnk_file) < 0 : load_embedded_bank() < 0) {
+				fprintf(stderr, "Could not load bank %s\n", bnk_file ? bnk_file : "(built-in)");
+				return 1;
 			}
-
-			if (chord_count > 0) {
-				test_play_chord(raw_inst, chord_notes, chord_count, test_duration);
-			} else {
-				// Single note fallback
-				test_play_instrument(raw_inst, test_note, test_duration);
+			ins = bank_index(test_prog);
+			if (!ins) {
+				fprintf(stderr, "No program %d in bank %s\n", test_prog, bnk_file ? bnk_file : "(built-in)");
+				return 1;
 			}
+			raw_inst = *ins;	// test_play overwrites melodic slot 0
+			ins = &raw_inst;
 		}
 
-		audio_close();
+		if (ins) {
+			if (audio_init(SAMPLE_RATE, 2) < 0) {
+				fprintf(stderr, "Unable to initialize audio\n");
+				return 1;
+			}
+			if (chord_count > 0)
+				test_play(ins, chord_notes, chord_count, test_duration);
+			else
+				test_play(ins, &test_note, 1, test_duration);
+			audio_close();
+		}
 		return 0;
     } else {
 
 	if (argc < 2 || argc > 3) {
-		fprintf(stderr,	"usage: %s file.mid [instruments.bnk]\n", argv[0]);
+		fprintf(stderr,	"usage: %s file.mid [instruments.bnk|instruments.op2]\n", argv[0]);
 		return 1;
 	}
 
 	if (argc == 3) {
-		if (load_bnk(argv[2]) < 0) {
+		if (load_bank(argv[2]) < 0) {
 			fprintf(stderr, "Could not load bank %s\n", argv[2]);
 			return 1;
 		}
-	} else {
-		size_t size;
-		size = (size_t)(_binary_mop_bnk_end - _binary_mop_bnk_start);
-
-		if (load_bnk_memory(_binary_mop_bnk_start, size) < 0) {
-			fprintf(stderr, "Could not load internal bank\n");
-			return 1;
-		}
+	} else if (load_embedded_bank() < 0) {
+		return 1;
 	}
 	// RIFF (little-endian) data guard
 	FILE* f = fopen(argv[1], "rb");
@@ -1191,16 +1275,15 @@ int main(int argc, char **argv) {
 	}
 
     init_state();
-
-    adlib_init(SAMPLE_RATE);
-	adlib_write(0x105, 0x01);
+    chip_init();
 
     play(song);
 
     audio_close();
-    free(events);
-    tml_free(song);
-	free(file_buffer);   //RIFF (little-endian) 
+    tml_free(song);	// file_buffer was already freed after loading
+#ifdef MOP_STATS
+    fprintf(stderr, "voice steals: %lu, second voices dropped: %lu\n", stat_steals, stat_dropped);
+#endif
     return 0;
 	}	
 }
